@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
 
     private var selectedBook: DocumentFile? = null
     @Volatile private var backgroundTask: Thread? = null
+    @Volatile private var backgroundTaskToken: Long = 0
 
     private data class RankedMatch(
         val file: DocumentFile,
@@ -55,7 +56,13 @@ class MainActivity : AppCompatActivity() {
         val similarity: Double
     )
 
-    private data class ScanBudget(var visited: Int = 0, var limitReached: Boolean = false)
+    private data class ScanBudget(
+        var filesVisited: Int = 0,
+        var entriesVisited: Int = 0,
+        var fileLimitReached: Boolean = false,
+        var entryLimitReached: Boolean = false,
+        var depthLimitReached: Boolean = false
+    )
 
     private val ignoredWords = setOf(
         "a", "an", "and", "are", "as", "at", "be", "book", "can", "could", "do", "does",
@@ -196,8 +203,15 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        backgroundTask?.interrupt()
+        cancelBackgroundTask()
         super.onDestroy()
+    }
+
+    private fun cancelBackgroundTask(): Long {
+        backgroundTask?.interrupt()
+        backgroundTask = null
+        backgroundTaskToken += 1
+        return backgroundTaskToken
     }
 
     private fun postToUi(action: () -> Unit) {
@@ -210,14 +224,14 @@ class MainActivity : AppCompatActivity() {
     private fun handleIncomingRequest(incoming: Intent?) {
         if (incoming?.action != Intent.ACTION_SEND) return
         val isTextMime = incoming.type?.startsWith("text/", ignoreCase = true) == true
-        val hasTextExtra = incoming.hasExtra(Intent.EXTRA_TEXT) || incoming.hasExtra(Intent.EXTRA_HTML_TEXT)
-        if (!isTextMime && !hasTextExtra) return
+        if (!isTextMime) return
         val subject = incoming.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim().orEmpty()
         val title = incoming.getCharSequenceExtra(Intent.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val body = incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim()
-            ?: incoming.getStringExtra(Intent.EXTRA_HTML_TEXT)?.let {
-                Html.fromHtml(it, Html.FROM_HTML_MODE_COMPACT).toString().trim()
-            }.orEmpty()
+        val plainBody = incoming.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val htmlBody = incoming.getStringExtra(Intent.EXTRA_HTML_TEXT)?.let {
+            Html.fromHtml(it, Html.FROM_HTML_MODE_COMPACT).toString().trim()
+        }.orEmpty()
+        val body = plainBody.ifBlank { htmlBody }
         val request = listOf(subject, title, body).filter { it.isNotBlank() }.distinct().joinToString("\n")
         if (request.isBlank()) return
 
@@ -268,18 +282,28 @@ class MainActivity : AppCompatActivity() {
         budget: ScanBudget,
         depth: Int
     ) {
-        if (depth > 8 || budget.limitReached || Thread.currentThread().isInterrupted) return
+        if (Thread.currentThread().isInterrupted) return
+        if (depth > MAX_SEARCH_DEPTH) {
+            budget.depthLimitReached = true
+            return
+        }
+        if (budget.fileLimitReached || budget.entryLimitReached) return
         for (file in dir.listFiles()) {
-            if (budget.limitReached || Thread.currentThread().isInterrupted) return
-            budget.visited++
-            if (budget.visited > MAX_SEARCH_FILES) {
-                budget.limitReached = true
+            if (budget.fileLimitReached || budget.entryLimitReached || Thread.currentThread().isInterrupted) return
+            budget.entriesVisited++
+            if (budget.entriesVisited > MAX_SEARCH_ENTRIES) {
+                budget.entryLimitReached = true
                 return
             }
             if (file.isDirectory) {
                 collectMatches(file, requestTokens, requestPhrase, out, budget, depth + 1)
                 continue
             }
+            if (budget.filesVisited >= MAX_SEARCH_FILES) {
+                budget.fileLimitReached = true
+                return
+            }
+            budget.filesVisited++
 
             val name = file.name ?: continue
             val lowerName = name.lowercase(Locale.ROOT)
@@ -301,6 +325,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun doSearch() {
+        val taskToken = cancelBackgroundTask()
         val request = requestInput.text.toString().trim()
         resultsBox.removeAllViews()
         replySection.visibility = View.GONE
@@ -327,7 +352,6 @@ class MainActivity : AppCompatActivity() {
         }
         statusText.text = "Searching book filenames..."
 
-        backgroundTask?.interrupt()
         val budget = ScanBudget()
         val worker = Thread {
             val matches = ArrayList<RankedMatch>()
@@ -349,10 +373,13 @@ class MainActivity : AppCompatActivity() {
             ).map { it.file }
 
             postToUi {
-                if (error != null) {
-                    statusText.text = "Search error: $error"
-                } else {
-                    showResults(request, sorted, budget.limitReached)
+                if (taskToken == backgroundTaskToken) {
+                    if (error != null) {
+                        statusText.text = "Search error: $error"
+                    } else {
+                        val searchIncomplete = budget.fileLimitReached || budget.entryLimitReached || budget.depthLimitReached
+                        showResults(request, sorted, searchIncomplete)
+                    }
                 }
             }
         }
@@ -364,7 +391,7 @@ class MainActivity : AppCompatActivity() {
         resultsBox.removeAllViews()
         if (matches.isEmpty()) {
             statusText.text = if (scanLimited) {
-                "No match in the first $MAX_SEARCH_FILES files scanned. Narrow the request or organize the folder and try again."
+                "No match was found before the search limit ($MAX_SEARCH_FILES files, $MAX_SEARCH_ENTRIES folder entries, or $MAX_SEARCH_DEPTH folder levels). Narrow the request or organize the folder and try again."
             } else {
                 "No matching PDF or EPUB filenames found for that request."
             }
@@ -373,7 +400,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         statusText.text = if (scanLimited) {
-            "${matches.size} matching file(s) in the first $MAX_SEARCH_FILES scanned. Narrow the request to search more precisely."
+            "${matches.size} matching file(s) found before the search limit ($MAX_SEARCH_FILES files, $MAX_SEARCH_ENTRIES folder entries, or $MAX_SEARCH_DEPTH folder levels); results may be incomplete."
         } else {
             "${matches.size} matching file(s). Tap a book to prepare a reply."
         }
@@ -394,6 +421,7 @@ class MainActivity : AppCompatActivity() {
         .trim()
 
     private fun prepareReply(file: DocumentFile) {
+        cancelBackgroundTask()
         val name = file.name ?: "book"
         selectedBook = file
         selectedBookText.text = "Selected book: $name"
@@ -414,9 +442,9 @@ class MainActivity : AppCompatActivity() {
         if (file.length() > 100L * 1024 * 1024) {
             Toast.makeText(this, "This file is over 100 MB. WhatsApp may reject it.", Toast.LENGTH_LONG).show()
         }
+        val taskToken = cancelBackgroundTask()
         statusText.text = "Preparing the selected file..."
 
-        backgroundTask?.interrupt()
         val worker = Thread {
             var shareDir: File? = null
             var targetFile: File? = null
@@ -457,7 +485,11 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 if (!Thread.currentThread().isInterrupted) {
-                    postToUi { launchWhatsAppShare(target, name, request, reply, file.uri.toString()) }
+                    postToUi {
+                        if (taskToken == backgroundTaskToken) {
+                            launchWhatsAppShare(target, name, request, reply, file.uri.toString())
+                        }
+                    }
                 }
             } catch (_: InterruptedException) {
                 targetFile?.delete()
@@ -466,7 +498,9 @@ class MainActivity : AppCompatActivity() {
                 targetFile?.delete()
                 shareDir?.deleteRecursively()
                 if (!Thread.currentThread().isInterrupted) {
-                    postToUi { statusText.text = "Could not prepare file: ${e.message}" }
+                    postToUi {
+                        if (taskToken == backgroundTaskToken) statusText.text = "Could not prepare file: ${e.message}"
+                    }
                 }
             }
         }
@@ -598,5 +632,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val PERSONAL_WHATSAPP_PACKAGE = "com.whatsapp"
         private const val MAX_SEARCH_FILES = 20_000
+        private const val MAX_SEARCH_ENTRIES = 50_000
+        private const val MAX_SEARCH_DEPTH = 8
     }
 }
